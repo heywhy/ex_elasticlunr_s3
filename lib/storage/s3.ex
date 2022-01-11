@@ -18,14 +18,14 @@ defmodule Elasticlunr.Storage.S3 do
   """
   use Elasticlunr.Storage
 
-  alias ExAws.S3
+  alias Elasticlunr.S3.ClientImpl
   alias Elasticlunr.{Index, Deserializer, Serializer}
+  alias Elasticlunr.Storage.Disk
 
   @impl true
   def load_all do
     config(:bucket)
-    |> S3.list_objects_v2()
-    |> ExAws.stream!(config_all())
+    |> client_module().list_objects(config_all())
     |> Stream.map(fn %{key: file} ->
       name = Path.basename(file, ".index")
 
@@ -40,9 +40,9 @@ defmodule Elasticlunr.Storage.S3 do
     data = Serializer.serialize(index)
 
     with path <- tmp_file("#{name}.index"),
-         :ok <- write_to_file(data, path),
+         :ok <- Disk.write_serialized_index_to_file(path, data),
          {:ok, _} <- upload_object(bucket, object, path) do
-      :ok
+      File.rm(path)
     end
   end
 
@@ -51,20 +51,23 @@ defmodule Elasticlunr.Storage.S3 do
     bucket = config(:bucket)
     object = "#{name}.index"
 
-    with path <- tmp_file("#{name}.index"),
-         {:ok, _} <- download_object(bucket, object, path) do
+    desirialize = fn path ->
       File.stream!(path, ~w[compressed]a)
       |> Deserializer.deserialize()
+    end
+
+    with path <- tmp_file("#{name}.index"),
+         {:ok, _} <- download_object(bucket, object, path),
+         %Index{} = index <- desirialize.(path),
+         :ok <- File.rm(path) do
+      index
     end
   end
 
   @impl true
   def delete(name) do
-    bucket = config(:bucket)
-
-    bucket
-    |> S3.delete_object("#{name}.index")
-    |> ExAws.request(config_all())
+    config(:bucket)
+    |> client_module().delete_object("#{name}.index", config_all())
     |> case do
       {:ok, _} ->
         :ok
@@ -74,24 +77,15 @@ defmodule Elasticlunr.Storage.S3 do
     end
   end
 
-  defp write_to_file(data, path) do
-    data
-    |> Stream.into(File.stream!(path, ~w[compressed]a), &"#{&1}\n")
-    |> Stream.run()
-  end
-
   defp download_object(bucket, object, file) do
-    bucket
-    |> S3.download_file(object, file)
-    |> ExAws.request(config_all())
+    client_module().download_object(bucket, object, file, config_all())
   end
 
-  defp upload_object(bucket, object, path) do
-    path
-    |> S3.Upload.stream_file()
-    |> S3.upload(bucket, object)
-    |> ExAws.request(config_all())
+  defp upload_object(bucket, object, file) do
+    client_module().upload_object(bucket, object, file, config_all())
   end
+
+  defp client_module, do: config(:client_module, ClientImpl)
 
   defp tmp_file(file) do
     Path.join(System.tmp_dir!(), file)
